@@ -11,10 +11,76 @@ from slack_sdk import WebClient
 
 load_dotenv()
 
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
 SCOPES = ["gmail.readonly", "calendar.readonly"]
+
+# Configuration: Important contacts whose emails are always urgent
+# Add email addresses or domains here (e.g., "boss@company.com", "@mycompany.com")
+IMPORTANT_CONTACTS = [
+    # Add your important contacts here
+]
+
+# Configuration: Marketing/domains to filter out
+# Emails from these domains will be filtered out before reaching the model
+MARKETING_DOMAINS = [
+    "newsletter@",
+    "noreply@",
+    "marketing@",
+    "promo@",
+    "deals@",
+    "unsubscribe@",
+    # Add more marketing domains as needed
+]
+
+# Keywords that trigger urgency regardless of sender
+URGENT_KEYWORDS = ["action required", "urgent", "deadline"]
+
+
+def extract_email_address(from_header: str) -> str:
+    """Extract email address from From header."""
+    if "<" in from_header and ">" in from_header:
+        return from_header[from_header.find("<") + 1:from_header.find(">")].lower()
+    return from_header.lower()
+
+
+def extract_domain(email: str) -> str:
+    """Extract domain from email address."""
+    return email.split("@")[-1] if "@" in email else email
+
+
+def is_important_sender(from_header: str) -> bool:
+    """Check if sender is in the important contacts list."""
+    email = extract_email_address(from_header)
+    domain = extract_domain(email)
+
+    for contact in IMPORTANT_CONTACTS:
+        if contact.startswith("@"):
+            # Domain match
+            if domain == contact[1:]:
+                return True
+        else:
+            # Full email match
+            if email == contact.lower():
+                return True
+    return False
+
+
+def has_urgent_keywords(subject: str) -> bool:
+    """Check if subject contains urgent keywords."""
+    subject_lower = subject.lower()
+    return any(keyword in subject_lower for keyword in URGENT_KEYWORDS)
+
+
+def is_marketing_email(from_header: str) -> bool:
+    """Check if email is from a marketing/spam domain."""
+    email = extract_email_address(from_header)
+    for pattern in MARKETING_DOMAINS:
+        if email.startswith(pattern):
+            return True
+    return False
 
 
 def get_google_credentials():
@@ -42,43 +108,77 @@ def get_google_credentials():
 def check_gmail(hours_back: int = 12) -> str:
     """Fetch UNREAD emails from the last N hours via Gmail API.
     Returns sender, subject, date, and a snippet truncated to 200 chars.
+    Filters out marketing emails and marks urgent emails based on sender or subject keywords.
     """
     try:
         creds = get_google_credentials()
         service = build("gmail", "v1", credentials=creds)
-        
+
         cutoff = datetime.utcnow() - timedelta(hours=hours_back)
         cutoff_str = cutoff.strftime("%Y/%m/%d")
-        
+
         results = service.users().messages().list(
             userId="me",
             q=f"is:unread after:{cutoff_str}"
         ).execute()
-        
+
         messages = results.get("messages", [])
         if not messages:
             return f"No unread emails found in the last {hours_back} hours."
-        
+
         email_list = []
-        for msg in messages[:20]:
+        filtered_count = 0
+
+        for msg in messages[:50]:  # Fetch more to account for filtering
             msg_data = service.users().messages().get(
                 userId="me",
                 id=msg["id"],
                 format="metadata",
                 metadataHeaders=["From", "Subject", "Date"]
             ).execute()
-            
+
             headers = {h["name"]: h["value"] for h in msg_data["payload"]["headers"]}
+            from_header = headers.get("From", "Unknown")
+            subject = headers.get("Subject", "No subject")
             snippet = msg_data.get("snippet", "")[:200]
-            
-            email_list.append(
-                f"From: {headers.get('From', 'Unknown')}\n"
-                f"Subject: {headers.get('Subject', 'No subject')}\n"
+
+            # Filter out marketing emails
+            if is_marketing_email(from_header):
+                filtered_count += 1
+                continue
+
+            # Determine urgency
+            urgent = False
+            if is_important_sender(from_header):
+                urgent = True
+            elif has_urgent_keywords(subject):
+                urgent = True
+
+            # Build email entry
+            email_entry = (
+                f"From: {from_header}\n"
+                f"Subject: {subject}\n"
                 f"Date: {headers.get('Date', 'Unknown')}\n"
                 f"Snippet: {snippet}\n"
             )
-        
-        return "\n---\n".join(email_list)
+
+            if urgent:
+                email_entry = f"[URGENT] {email_entry}"
+
+            email_list.append(email_entry)
+
+            # Stop after 20 non-filtered emails
+            if len(email_list) >= 20:
+                break
+
+        if not email_list:
+            return f"No unread emails found in the last {hours_back} hours (filtered {filtered_count} marketing emails)."
+
+        result = "\n---\n".join(email_list)
+        if filtered_count > 0:
+            result = f"{result}\n\n[Filtered {filtered_count} marketing emails]"
+
+        return result
     except Exception as e:
         return f"Error fetching Gmail: {str(e)}"
 
@@ -204,19 +304,36 @@ SLACK HIGHLIGHTS
 OTHER EMAILS
 SUGGESTED ACTIONS
 
+Urgency Handling:
+- Emails marked with [URGENT] are from important contacts or contain urgent keywords (action required, urgent, deadline)
+- These MUST appear in the URGENT section at the top
+- All other emails go in OTHER EMAILS
+
 Keep it concise and prioritized. If a source returned nothing or errored, explicitly state that. Focus on what matters most for the day ahead."""
 
 
 def run():
     """Create the agent and run the morning briefing."""
-    model = LiteLLMModel(
-        client_args={
-            "api_key": OPENROUTER_API_KEY,
-            "api_base": "https://openrouter.ai/api/v1"
-        },
-        model_id="openrouter/openai/gpt-3.5-turbo",
-        params={"max_tokens": 4096}
-    )
+    # Prefer Anthropic if available, otherwise use OpenRouter
+    if ANTHROPIC_API_KEY:
+        model = LiteLLMModel(
+            client_args={
+                "api_key": ANTHROPIC_API_KEY
+            },
+            model_id="anthropic/claude-3-haiku-20240307",
+            params={"max_tokens": 4096}
+        )
+    elif OPENROUTER_API_KEY:
+        model = LiteLLMModel(
+            client_args={
+                "api_key": OPENROUTER_API_KEY,
+                "api_base": "https://openrouter.ai/api/v1"
+            },
+            model_id="openrouter/openai/gpt-3.5-turbo",
+            params={"max_tokens": 4096}
+        )
+    else:
+        raise ValueError("Neither ANTHROPIC_API_KEY nor OPENROUTER_API_KEY is set in .env")
     
     agent = Agent(
         model=model,
