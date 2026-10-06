@@ -1,7 +1,8 @@
 import os
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from strands_agents import Agent, LiteLLM, tool
+from strands import Agent, tool
+from strands.models.litellm import LiteLLMModel
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -208,10 +209,12 @@ Keep it concise and prioritized. If a source returned nothing or errored, explic
 
 def run():
     """Create the agent and run the morning briefing."""
-    model = LiteLLM(
-        base_url="https://openrouter.ai/api/v1",
-        model_id="openrouter/openrouter/free",
-        api_key=OPENROUTER_API_KEY,
+    model = LiteLLMModel(
+        client_args={
+            "api_key": OPENROUTER_API_KEY,
+            "api_base": "https://openrouter.ai/api/v1"
+        },
+        model_id="openrouter/openai/gpt-3.5-turbo",
         params={"max_tokens": 4096}
     )
     
@@ -221,7 +224,7 @@ def run():
         system_prompt=SYSTEM_PROMPT
     )
     
-    result = agent.run("What did I miss? Give me my morning briefing.")
+    result = agent("What did I miss? Give me my morning briefing.")
     print(result)
 
 
